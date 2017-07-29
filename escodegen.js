@@ -65,14 +65,244 @@
         FORMAT_MINIFY,
         FORMAT_DEFAULTS;
 
-    estraverse = require('estraverse');
+    estraverse = require('estraverse-fb');
     esutils = require('esutils');
 
     Syntax = estraverse.Syntax;
 
+    function CodeGenerator() {
+    }
+    //####-JSX-####
+    //##-JSX-FLAGS-START##
+    var F_JSX_NOINDENT = 1 << 8,
+        F_JSX_NOPAREN = 1 << 9;
+    //##-JSX-FLAGS-END##
+
+    //##-JSX-EXPRESSION-DEFINITIONS-START##
+    CodeGenerator.JSXExpression = {
+
+        JSXText: function (expr, precedence, flags) {
+            return [expr.raw];
+        },
+
+        JSXAttribute: function (expr, precedence, flags) {
+            var result = [];
+
+            var fragment = this.generateExpression(expr.name, Precedence.Sequence, {
+                allowIn: true,
+                allowCall: true
+            });
+            result.push(fragment);
+
+            if (expr.value) {
+                result.push('=');
+
+                if (expr.value.type === Syntax.Literal) {
+                    fragment = jsxEscapeAttr(expr.value.value, expr.value.raw);
+
+                } else {
+                    fragment = this.generateExpression(expr.value, Precedence.Sequence, {
+                        allowIn: true,
+                        allowCall: true
+                    });
+                }
+                result.push(fragment);
+            }
+            return result;
+        },
+
+        JSXClosingElement: function (expr, precedence, flags) {
+            return [
+                '</',
+                this.generateExpression(expr.name, Precedence.Sequence, 0),
+                '>'
+            ];
+        },
+
+        JSXElement: function (expr, precedence, flags) {
+            var result = [], that = this;
+
+            if (!(flags & F_JSX_NOINDENT)) {
+                base += indent;
+            }
+
+            var fragment = this.generateExpression(expr.openingElement, Precedence.JSXElement, {
+                allowIn: true,
+                allowCall: true
+            });
+            result.push(fragment);
+
+            var jsxFragments = [];
+            var multiline = !expr.openingElement.selfClosing &&
+                hasLineTerminator(toSourceNodeWhenNeeded(fragment).toString());
+
+            var i, len;
+            withIndent(function(indent) {
+                for (i = 0, len = expr.children.length; i < len; ++i) {
+                    if (expr.children[i].type === Syntax.Literal) {
+                        fragment = expr.children[i].raw.trim();
+                        if (fragment) {
+                            jsxFragments.push(fragment);
+                        }
+                        continue;
+                    }
+
+                    fragment = that.generateExpression(expr.children[i], Precedence.JSXElement, E_TTF | F_JSX_NOINDENT);
+
+                    jsxFragments.push(fragment);
+                    multiline = multiline || jsxHasNode(expr.children[i]);
+                }
+
+                multiline = multiline || jsxFragments.length > 1 ||
+                    (jsxFragments.length &&
+                        hasLineTerminator(toSourceNodeWhenNeeded(jsxFragments[0]).toString()));
+
+                for (i = 0, len = jsxFragments.length; i < len; ++i) {
+                    if (multiline) {
+                        result.push(newline + indent);
+                    }
+                    result.push(jsxFragments[i]);
+                }
+            });
+
+            if (multiline) {
+                result.push(newline + base);
+            }
+
+            if (expr.closingElement) {
+                fragment = that.generateExpression(expr.closingElement, Precedence.JSXElement, 0);
+                result.push(fragment);
+            }
+
+            if (!(flags & F_JSX_NOINDENT)) {
+                base = base.slice(0, base.length - indent.length);
+                if (hasLineTerminator(toSourceNodeWhenNeeded(result).toString())) {
+                    if (flags & F_JSX_NOPAREN) {
+                        result = [
+                            newline + base + indent,
+                            result
+                        ];
+                    } else {
+                        result = [
+                            '(' + newline + base + indent,
+                            result,
+                            newline + base + ')'
+                        ];
+                    }
+                }
+            }
+            return result;
+        },
+
+        JSXExpressionContainer: function (expr, precedence, flags) {
+            return [
+                '{',
+                this.generateExpression(expr.expression, Precedence.Sequence, E_TTF),
+                '}'
+            ];
+        },
+
+        JSXIdentifier: function (expr, precedence, flags) {
+            return expr.name;
+        },
+
+        JSXMemberExpression: function (expr, precedence, flags) {
+            return [
+                this.generateExpression(expr.object, Precedence.Sequence, E_TFF),
+                '.',
+                this.generateExpression(expr.property, Precedence.Sequence, 0)
+            ];
+        },
+
+        JSXNamespacedName: function (expr, precedence, flags) {
+            return [
+                this.generateExpression(expr.namespace, Precedence.Sequence, 0),
+                '.',
+                this.generateExpression(expr.name, Precedence.Sequence, 0)
+            ];
+        },
+
+        JSXOpeningElement: function (expr, precedence, flags) {
+            var result = ['<'], that = this;
+
+            var fragment = this.generateExpression(expr.name, Precedence.Sequence, 0);
+            result.push(fragment);
+
+            var jsxFragments = [];
+            for (var i = 0, len = expr.attributes.length; i < len; ++i) {
+                fragment = that.generateExpression(expr.attributes[i], Precedence.Sequence, E_TTF);
+                jsxFragments.push({
+                    expr: expr.attributes[i],
+                    name: expr.attributes[i].name.name,
+                    fragment: fragment,
+                    multiline: hasLineTerminator(toSourceNodeWhenNeeded(fragment).toString())
+                });
+                if (expr.attributes.length > 3 && expr.attributes[i].value &&
+                    expr.attributes[i].value.type !== Syntax.Literal) {
+                    jsxFragments[jsxFragments.length - 1].multiline = true;
+                }
+            }
+
+            jsxFragments.sort(function(a, b) {
+                if (!a.multiline && !b.multiline) {
+                    return a.name > b.name ? 1 : -1;
+                }
+                if (!a.multiline) {
+                    return -1;
+                }
+                if (!b.multiline) {
+                    return 1;
+                }
+                return a.name > b.name ? 1 : -1;
+            });
+
+            withIndent(function(indent) {
+                for (var i = 0, len = jsxFragments.length; i < len; ++i) {
+                    if ((i > 0 && i % 3 === 0) ||
+                        jsxFragments[i].multiline) {
+                        result.push(newline + indent);
+                    } else {
+                        result.push(' ');
+                    }
+
+                    // generate expression again
+                    result.push(that.generateExpression(jsxFragments[i].expr, Precedence.Sequence, E_TTF));
+                }
+            });
+
+            result.push(expr.selfClosing ? '/>' : '>');
+            return result;
+        }
+    };
+    merge(CodeGenerator.prototype, CodeGenerator.JSXExpression);
+    //##-JSX-EXPRESSION-DEFINITIONS-END##
+
+    //##-JSX-HELPER_FUNCTIONS-START-##
+    function jsxEscapeAttr(s, raw) {
+        if (s.indexOf('"') >= 0 || s.indexOf('\'') >= 0) {
+            return raw;
+        }
+        return quotes === 'double' ? '"' + s + '"' : '\'' + s + '\'';
+    }
+    function jsxHasNode(expr) {
+        if (expr.type !== Syntax.JSXElement) {
+            return false;
+        }
+
+        for (var i = 0, len = expr.children.length; i < len; ++i) {
+            if (expr.children[i].type === Syntax.JSXElement) {
+                return true;
+            }
+        }
+        return false;
+    }
+    //##-JSX-HELPER_FUNCTIONS-END-##
+    //####-JSX-####
+
+    //###-JSX-EXPRESSION-CHECK-ADDED-###
     // Generation is done by generateExpression.
     function isExpression(node) {
-        return CodeGenerator.Expression.hasOwnProperty(node.type);
+        return CodeGenerator.Expression.hasOwnProperty(node.type) || CodeGenerator.JSXExpression.hasOwnProperty(node.type);
     }
 
     // Generation is done by generateStatement.
@@ -823,10 +1053,7 @@
         return toSourceNodeWhenNeeded(result, expr);
     }
 
-    function CodeGenerator() {
-    }
-
-    // Helpers.
+    // CodeGenerator Helpers.
 
     CodeGenerator.prototype.maybeBlock = function(stmt, flags) {
         var result, noLeadingComment, that = this;
@@ -1877,7 +2104,7 @@
             result = [this.generateExpression(expr.callee, Precedence.Call, E_TTF)];
             result.push('(');
             for (i = 0, iz = expr['arguments'].length; i < iz; ++i) {
-                result.push(this.generateExpression(expr['arguments'][i], Precedence.Assignment, E_TTT));
+                result.push(this.generateExpression(expr['arguments'][i], Precedence.Assignment, E_TTT | F_JSX_NOPAREN));
                 if (i + 1 < iz) {
                     result.push(',' + space);
                 }
@@ -2075,7 +2302,7 @@
                         }
                     } else {
                         result.push(multiline ? indent : '');
-                        result.push(that.generateExpression(expr.elements[i], Precedence.Assignment, E_TTT));
+                        result.push(that.generateExpression(expr.elements[i], Precedence.Assignment, E_TTT | F_JSX_NOINDENT | F_JSX_NOPAREN));
                     }
                     if (i + 1 < iz) {
                         result.push(',' + (multiline ? newline : space));
@@ -2442,7 +2669,6 @@
         ModuleSpecifier: function (expr, precedence, flags) {
             return this.Literal(expr, precedence, flags);
         }
-
     };
 
     merge(CodeGenerator.prototype, CodeGenerator.Expression);
